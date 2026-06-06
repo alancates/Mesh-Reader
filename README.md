@@ -4,7 +4,7 @@ A project workspace for building Mesh-Reader with Perplexity.
 
 ## Goal
 
-Describe in one sentence what Mesh-Reader should do.
+Read mesh files in viewer cache and save them as OBJ files for import to Blender 5+.
 
 ## Current status
 
@@ -12,4 +12,10 @@ Project created. Initial setup in progress.
 
 ## How to run
 
-Instructions will be added as the project develops.
+Instructions:
+At start of a Perplexity session paste:
+  Project: Mesh-Reader
+  Goal: Read/save SL mesh cache files as OBJ for Blender
+  Last done: [what you finished]
+  Working on now: [current task]
+  Blocker: [any problem, or "none"]
