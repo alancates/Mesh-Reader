@@ -19,3 +19,14 @@ At start of a Perplexity session paste:
   Last done: [what you finished]
   Working on now: [current task]
   Blocker: [any problem, or "none"]
+
+## Firestorm source leads
+
+Core mesh/model code:
+- indra/llprimitive/llmodel.h
+- indra/llprimitive/llmodel.cpp
+- indra/llprimitive/llmodelloader.h
+- indra/llprimitive/llmodelloader.cpp
+
+Reason:
+These files define LLModel and LLModelLoader, which appear to be the main mesh/model classes in Firestorm.
