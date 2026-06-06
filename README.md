@@ -30,3 +30,29 @@ Core mesh/model code:
 
 Reason:
 These files define LLModel and LLModelLoader, which appear to be the main mesh/model classes in Firestorm.
+
+# Firestorm research
+
+## Goal
+Identify the viewer cache mesh format and translate it into original Python parsing code.
+
+## Verified leads
+- Firestorm official source repo:
+  - https://github.com/FirestormViewer/phoenix-firestorm
+- Core mesh/model files previously identified:
+  - indra/llprimitive/llmodel.h
+  - indra/llprimitive/llmodel.cpp
+  - indra/llprimitive/llmodelloader.h
+  - indra/llprimitive/llmodelloader.cpp
+
+## Next searches
+- LLMeshRepository
+- meshrepository
+- mesh cache
+- cache
+- header
+- decompress
+- inflate
+
+## Notes
+Keep final Mesh-Reader code original.
