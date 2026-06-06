@@ -9,4 +9,5 @@
 
 ## Purpose
 
-These are reference files for understanding Firestorm mesh/model structures and translating them into Python.
+These are reference files for understanding Firestorm mesh/model structures and translating them into Python
+
