@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from struct import unpack_from
-from typing import Iterable
+import argparse
 import zlib
 
 
@@ -13,6 +13,7 @@ class MeshHeader:
     version: int | None = None
     flags: int | None = None
     raw_size: int = 0
+    decompressed_size: int = 0
 
 
 @dataclass
@@ -71,20 +72,21 @@ def maybe_decompress(data: bytes) -> bytes:
     return data
 
 
-def parse_header(data: bytes) -> MeshHeader:
-    header = MeshHeader(raw_size=len(data))
-    if len(data) >= 4:
-        header.magic = data[:4]
+def parse_header(raw_data: bytes, parsed_data: bytes) -> MeshHeader:
+    header = MeshHeader(
+        raw_size=len(raw_data),
+        decompressed_size=len(parsed_data),
+    )
+    if len(parsed_data) >= 4:
+        header.magic = parsed_data[:4]
     return header
 
 
-def parse_mesh(data: bytes) -> MeshData:
-    data = maybe_decompress(data)
-    header = parse_header(data)
-    _ = header
-
+def parse_mesh(data: bytes) -> tuple[MeshHeader, MeshData]:
+    parsed = maybe_decompress(data)
+    header = parse_header(data, parsed)
     mesh = MeshData()
-    return mesh
+    return header, mesh
 
 
 def write_obj(mesh: MeshData, output_path: str | Path) -> None:
@@ -107,9 +109,33 @@ def write_obj(mesh: MeshData, output_path: str | Path) -> None:
 
 def convert_file(input_path: str | Path, output_path: str | Path) -> None:
     raw = read_bytes(input_path)
-    mesh = parse_mesh(raw)
+    header, mesh = parse_mesh(raw)
+
+    print(f"Input bytes: {header.raw_size}")
+    print(f"Parsed bytes: {header.decompressed_size}")
+    print(f"Magic: {header.magic!r}")
+    print(f"Vertices: {len(mesh.vertices)}")
+    print(f"Faces: {len(mesh.faces)}")
+    print(f"UVs: {len(mesh.uvs)}")
+
     write_obj(mesh, output_path)
+    print(f"Wrote OBJ: {output_path}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read a mesh cache file and write a basic OBJ."
+    )
+    parser.add_argument("input_file", help="Path to input mesh cache file")
+    parser.add_argument("output_file", help="Path to output OBJ file")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    convert_file(args.input_file, args.output_file)
 
 
 if __name__ == "__main__":
-    print("Mesh-Reader foundation ready.")
+    main()
