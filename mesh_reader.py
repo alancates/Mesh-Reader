@@ -181,15 +181,45 @@ def cmd_inspect(args):
 
 
 def cmd_dump(args):
-    """Dump one entry body by local_id."""
+    """Dump one entry body by local_id with field decoding."""
     _, _, entries = read_slc(args.inputfile)
     target = int(args.localid)
     for e in entries:
         if e.header.local_id == target:
-            print(f'local_id={target}  body={len(e.body)} bytes')
-            print(hexdump(e.body, 256))
+            b = e.body
+            print(f"local_id={target}  body={len(b)} bytes")
+            print(hexdump(b, 256))
+            print()
+            if len(b) >= 0x34:
+                import uuid
+                obj_uuid = uuid.UUID(bytes=b[0:16])
+                local_id, = unpack_from('<I', b, 0x10)
+                pcode = b[0x14]
+                state  = b[0x15]
+                crc,   = unpack_from('<I', b, 0x16)
+                mat    = b[0x1A]
+                click  = b[0x1B]
+                sx, sy, sz = unpack_from('<fff', b, 0x1C)
+                px, py, pz = unpack_from('<fff', b, 0x28)
+                rx, ry, rz = unpack_from('<fff', b, 0x34)
+                sc,    = unpack_from('<I', b, 0x40)
+                print(f"  UUID      : {obj_uuid}")
+                print(f"  LocalID   : {local_id}")
+                print(f"  PCode     : 0x{pcode:02x} ({pcode})")
+                print(f"  State     : 0x{state:02x}")
+                print(f"  CRC       : 0x{crc:08x}")
+                print(f"  Material  : {mat}")
+                print(f"  ClickAct  : {click}")
+                print(f"  Scale     : ({sx:.4f}, {sy:.4f}, {sz:.4f})")
+                print(f"  Position  : ({px:.4f}, {py:.4f}, {pz:.4f})")
+                print(f"  Rotation  : ({rx:.4f}, {ry:.4f}, {rz:.4f})")
+                print(f"  SpecialCode: 0x{sc:08x}")
+                has_omega    = bool(sc & 0x80)
+                has_parentid = bool(sc & 0x20)
+                print(f"  HasOmega  : {has_omega}")
+                print(f"  HasParent : {has_parentid}")
             return
-    print(f'local_id {target} not found.')
+    print(f"local_id {target} not found.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

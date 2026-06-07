@@ -22,3 +22,5 @@ Read and save Second Life mesh cached files as OBJ or other Blender-importable f
 ## Status log
 
 - 2026-06-06: Repository created. README and PROJECT.md added.
+
+- 2026-06-06: Binary format fully decoded. Position/Scale/Rotation extracting correctly from .slc files. Next: add `list` command to export all objects to CSV.
