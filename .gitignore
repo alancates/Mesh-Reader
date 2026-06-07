@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Local outputs
+output/
+tmp/
+logs/
+
+# Cache samples / large local artifacts
+*.slc
+*.slec
+*.obj
+*.bin
+*.dat
+
+# Optional extracted XML outputs
+*.xml
+*.txt
+
+# Reference Firestorm Files
+/reference/
