@@ -14,7 +14,7 @@ import binascii
 import csv
 import math
 
-# -- Constants from llvocache.cpp ---------------------------------------------
+# ── Constants from llvocache.cpp ──────────────────────────────────────────────
 ENTRY_HEADER_SIZE   = 6 * 4      # 6 x S32/U32 = 24 bytes
 MAX_ENTRY_BODY_SIZE = 10_000
 MAX_NUM_ENTRIES     = 128
@@ -30,8 +30,7 @@ DISCOVERY_COLUMNS = [
     'bbox_max_z', 'notes'
 ]
 
-
-# -- Structs ------------------------------------------------------------------
+# ── Structs ───────────────────────────────────────────────────────────────────
 
 @dataclass
 class HeaderMetaInfo:
@@ -72,12 +71,12 @@ class VOCacheEntryHeader:
     crc_change_count: int = 0
     body_size: int = 0
 
-    SIZE = calcsize('<6I')
-
     @classmethod
     def read(cls, data: bytes, offset: int = 0) -> 'VOCacheEntryHeader':
-        local_id, crc, hit_count, dupe_count, crc_change_count, body_size = unpack_from('<6I', data, offset)
-        return cls(local_id, crc, hit_count, dupe_count, crc_change_count, body_size)
+        local_id, crc, hit_count, dupe_count, crc_change_count, body_size = \
+            unpack_from('<IIiiiI', data, offset)
+        return cls(local_id, crc, hit_count, dupe_count,
+                   crc_change_count, body_size)
 
 
 @dataclass
@@ -86,134 +85,174 @@ class VOCacheEntry:
     body: bytes
 
 
-# -- Helpers ------------------------------------------------------------------
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def hexdump(data: bytes, limit: int = 256) -> str:
     chunk = data[:limit]
     lines = []
     for off in range(0, len(chunk), 16):
         row = chunk[off:off + 16]
-        hexpart = ' '.join(f'{b:02x}' for b in row)
-        ascpart = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row)
-        lines.append(f'{off:04x}  {hexpart:<47}  {ascpart}')
+        hex_part = ' '.join(f'{b:02x}' for b in row)
+        asc_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row)
+        lines.append(f'  {off:04x}  {hex_part:<47}  {asc_part}')
     return '\n'.join(lines)
 
 
 def uuid_bytes_to_str(b: bytes) -> str:
     h = binascii.hexlify(b).decode()
-    return f'{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}'
+    return f'{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}'
 
 
-def default_csv_path(input_path: str | Path) -> Path:
-    p = Path(input_path)
-    return p.with_suffix('.csv')
+def maybe_uuid(body: bytes, offset: int) -> str:
+    if offset + UUID_BYTES > len(body):
+        return ''
+    raw = body[offset:offset + UUID_BYTES]
+    if not any(raw):
+        return ''
+    return uuid_bytes_to_str(raw)
+
+
+def default_csv_path(input_path):
+    input_path = Path(input_path)
+    return input_path.with_suffix('.csv')
+
+
+def unpack_vec3(body: bytes, offset: int):
+    if offset + 12 > len(body):
+        return None
+    return unpack_from('<fff', body, offset)
 
 
 def decode_object_body(body: bytes) -> dict:
     obj = {
         'full_id': '',
-        'local_id': None,
-        'pcode': None,
-        'state': None,
-        'crc': None,
-        'scale_x': None, 'scale_y': None, 'scale_z': None,
-        'pos_x': None, 'pos_y': None, 'pos_z': None,
-        'rot_x': None, 'rot_y': None, 'rot_z': None, 'rot_w': None,
-        'update_flags': None,
+        'local_id': '',
         'parent_id': '',
         'root_id': '',
-        'mesh_id': '',
+        'pcode': '',
+        'state': '',
+        'update_flags': '',
+        'crc': '',
+        'name': '',
+        'description': '',
         'owner_id': '',
         'creator_id': '',
         'group_id': '',
         'asset_id': '',
-        'name': '',
-        'description': '',
-        'notes': '',
+        'mesh_id': '',
+        'pos': None,
+        'scale': None,
+        'rot': None,
+        'special_code': None,
+        'notes': ''
     }
 
-    try:
-        if len(body) >= 0x44:
-            obj['full_id'] = uuid_bytes_to_str(body[0:16])
-            obj['local_id'], = unpack_from('<I', body, 0x10)
-            obj['pcode'] = body[0x14]
-            obj['state'] = body[0x15]
-            obj['crc'], = unpack_from('<I', body, 0x16)
-            sx, sy, sz = unpack_from('<fff', body, 0x1C)
-            px, py, pz = unpack_from('<fff', body, 0x28)
-            rx, ry, rz = unpack_from('<fff', body, 0x34)
-            obj['scale_x'], obj['scale_y'], obj['scale_z'] = sx, sy, sz
-            obj['pos_x'], obj['pos_y'], obj['pos_z'] = px, py, pz
-            obj['rot_x'], obj['rot_y'], obj['rot_z'] = rx, ry, rz
-            obj['rot_w'] = None
-            obj['update_flags'], = unpack_from('<I', body, 0x40)
+    if len(body) < 0x44:
+        obj['notes'] = 'body_too_small'
+        return obj
 
-            if obj['update_flags'] & 0x20 and len(body) >= 0x48:
-                parent_id, = unpack_from('<I', body, 0x44)
-                obj['parent_id'] = str(parent_id)
-                obj['root_id'] = str(parent_id) if parent_id != 0 else ''
-        else:
-            obj['notes'] = 'body_too_short'
-    except Exception as exc:
-        obj['notes'] = f'decode_error:{exc}'
+    obj['full_id'] = maybe_uuid(body, 0x00)
+    obj['local_id'] = unpack_from('<I', body, 0x10)[0]
+    obj['pcode'] = body[0x14]
+    obj['state'] = body[0x15]
+    obj['crc'] = unpack_from('<I', body, 0x16)[0]
+    obj['scale'] = unpack_vec3(body, 0x1C)
+    obj['pos'] = unpack_vec3(body, 0x28)
 
-    if obj['pcode'] == 9 and obj['full_id']:
-        obj['mesh_id'] = obj['full_id']
+    rot_xyz = unpack_vec3(body, 0x34)
+    if rot_xyz is not None:
+        rx, ry, rz = rot_xyz
+        rw_sq = max(0.0, 1.0 - (rx * rx + ry * ry + rz * rz))
+        obj['rot'] = (rx, ry, rz, math.sqrt(rw_sq))
 
+    obj['special_code'] = unpack_from('<I', body, 0x40)[0]
+    obj['owner_id'] = maybe_uuid(body, 0x44)
+
+    offset = 0x54
+    if obj['special_code'] & 0x80:
+        if offset + 12 > len(body):
+            obj['notes'] = 'truncated_omega'
+            return obj
+        offset += 12
+
+    if obj['special_code'] & 0x20:
+        if offset + 4 > len(body):
+            obj['notes'] = 'truncated_parent_id'
+            return obj
+        obj['parent_id'] = unpack_from('<I', body, offset)[0]
+
+    notes = []
+    if obj['special_code'] & 0x20:
+        notes.append('has_parent')
+    if obj['pcode'] == 9:
+        notes.append('mesh_pcode')
+    obj['notes'] = ','.join(notes)
     return obj
 
 
-def object_to_discovery_row(
-    obj: dict,
-    source_file: str,
-    record_index: int,
-    ref_point: tuple[float, float, float] | None = None,
-) -> dict:
-    row = {k: '' for k in DISCOVERY_COLUMNS}
+def object_to_discovery_row(obj, source_file, record_index, ref_point=None):
+    row = {col: '' for col in DISCOVERY_COLUMNS}
     row['source_file'] = source_file
     row['record_index'] = record_index
+    row['local_id'] = obj.get('local_id', '')
+    row['full_id'] = obj.get('full_id', '')
+    row['parent_id'] = obj.get('parent_id', '')
+    row['root_id'] = obj.get('root_id', '')
+    row['pcode'] = obj.get('pcode', '')
+    row['state'] = obj.get('state', '')
+    row['update_flags'] = obj.get('update_flags', '')
+    row['crc'] = obj.get('crc', '')
+    row['name'] = obj.get('name', '')
+    row['description'] = obj.get('description', '')
+    row['owner_id'] = obj.get('owner_id', '')
+    row['creator_id'] = obj.get('creator_id', '')
+    row['group_id'] = obj.get('group_id', '')
+    row['asset_id'] = obj.get('asset_id', '')
+    row['mesh_id'] = obj.get('mesh_id', '')
 
-    for k in row:
-        if k in obj and obj[k] is not None:
-            row[k] = obj[k]
+    parent_id = obj.get('parent_id', '')
+    row['is_root'] = parent_id in ('', None, 0)
+    row['is_child'] = not row['is_root']
+    row['is_mesh_candidate'] = bool(obj.get('pcode') == 9 or obj.get('mesh_id'))
 
-    parent = row.get('parent_id', '')
-    row['is_root'] = 1 if parent in ('', '0', 0) else 0
-    row['is_child'] = 0 if row['is_root'] else 1
-    row['is_mesh_candidate'] = 1 if row.get('pcode') == 9 else 0
+    pos = obj.get('pos')
+    scale = obj.get('scale')
+    rot = obj.get('rot')
 
-    try:
-        px = float(row['pos_x'])
-        py = float(row['pos_y'])
-        pz = float(row['pos_z'])
-        sx = float(row['scale_x'])
-        sy = float(row['scale_y'])
-        sz = float(row['scale_z'])
+    if pos is not None:
+        row['pos_x'], row['pos_y'], row['pos_z'] = pos
+    if scale is not None:
+        row['scale_x'], row['scale_y'], row['scale_z'] = scale
+    if rot is not None:
+        row['rot_x'], row['rot_y'], row['rot_z'], row['rot_w'] = rot
 
-        row['bbox_min_x'] = px - sx / 2.0
-        row['bbox_min_y'] = py - sy / 2.0
-        row['bbox_min_z'] = pz - sz / 2.0
-        row['bbox_max_x'] = px + sx / 2.0
-        row['bbox_max_y'] = py + sy / 2.0
-        row['bbox_max_z'] = pz + sz / 2.0
+    if ref_point is not None and pos is not None:
+        dx = pos[0] - ref_point[0]
+        dy = pos[1] - ref_point[1]
+        dz = pos[2] - ref_point[2]
+        row['distance_from_reference'] = math.sqrt(dx * dx + dy * dy + dz * dz)
 
-        if ref_point is not None:
-            dx = px - ref_point[0]
-            dy = py - ref_point[1]
-            dz = pz - ref_point[2]
-            row['distance_from_reference'] = math.sqrt(dx * dx + dy * dy + dz * dz)
-    except Exception:
-        pass
+    if pos is not None and scale is not None:
+        hx = scale[0] / 2.0
+        hy = scale[1] / 2.0
+        hz = scale[2] / 2.0
+        row['bbox_min_x'] = pos[0] - hx
+        row['bbox_min_y'] = pos[1] - hy
+        row['bbox_min_z'] = pos[2] - hz
+        row['bbox_max_x'] = pos[0] + hx
+        row['bbox_max_y'] = pos[1] + hy
+        row['bbox_max_z'] = pos[2] + hz
 
+    row['notes'] = obj.get('notes', '')
     return row
 
 
-# -- Readers ------------------------------------------------------------------
+# ── Readers ───────────────────────────────────────────────────────────────────
 
 def read_object_cache(path: str | Path) -> tuple[HeaderMetaInfo, list[HeaderEntryInfo]]:
+    """Read object.cache — returns (meta, list of region entries)."""
     data = Path(path).read_bytes()
     meta = HeaderMetaInfo.read(data, 0)
-
     entries = []
     offset = HeaderMetaInfo.SIZE
     while offset + HeaderEntryInfo.SIZE <= len(data):
@@ -222,30 +261,34 @@ def read_object_cache(path: str | Path) -> tuple[HeaderMetaInfo, list[HeaderEntr
         if entry.time == 0:
             continue
         entries.append(entry)
-
     return meta, entries
 
 
 def read_slc(path: str | Path) -> tuple[bytes, int, list[VOCacheEntry]]:
+    """
+    Read objectsXXYY.slc
+    Format: [16 UUID][4 S32 count][entries...]
+    Each entry: [24-byte header][body_size bytes]
+    """
     data = Path(path).read_bytes()
     offset = 0
 
     region_id = data[offset:offset + UUID_BYTES]
     offset += UUID_BYTES
 
-    num_entries, = unpack_from('<I', data, offset)
+    num_entries, = unpack_from('<i', data, offset)
     offset += 4
 
     entries = []
     for _ in range(num_entries):
         if offset + ENTRY_HEADER_SIZE > len(data):
             break
-
         hdr = VOCacheEntryHeader.read(data, offset)
         offset += ENTRY_HEADER_SIZE
 
-        if hdr.body_size < 0 or hdr.body_size > MAX_ENTRY_BODY_SIZE:
-            print(f'WARNING: bogus body_size {hdr.body_size} for local_id {hdr.local_id}, stopping.')
+        if hdr.body_size <= 0 or hdr.body_size > MAX_ENTRY_BODY_SIZE:
+            print(f'  WARNING: bogus body_size {hdr.body_size} '
+                  f'for local_id {hdr.local_id}, stopping.')
             break
 
         body = data[offset:offset + hdr.body_size]
@@ -255,65 +298,73 @@ def read_slc(path: str | Path) -> tuple[bytes, int, list[VOCacheEntry]]:
     return region_id, num_entries, entries
 
 
-# -- CLI commands -------------------------------------------------------------
+# ── CLI commands ──────────────────────────────────────────────────────────────
 
 def cmd_index(args):
+    """Inspect object.cache index file."""
     meta, entries = read_object_cache(args.inputfile)
-    print(f'object.cache: {args.inputfile}')
+    print(f'=== object.cache: {args.inputfile} ===')
     print(f'Version      : {meta.version}')
     print(f'Address size : {meta.address_size}')
     print(f'Regions found: {len(entries)}')
     print()
-
     for i, e in enumerate(entries):
         rx = (e.handle >> 32) & 0xFFFFFFFF
         ry = e.handle & 0xFFFFFFFF
-        print(f'{i:3d} index={e.index:4d} region=({rx},{ry}) handle=0x{e.handle:016x} time={e.time}')
+        print(f'  [{i:3d}] index={e.index:4d}  '
+              f'region=({rx},{ry})  '
+              f'handle=0x{e.handle:016x}  '
+              f'time={e.time}')
 
 
 def cmd_inspect(args):
+    """Inspect an .slc data file."""
     region_id, expected, entries = read_slc(args.inputfile)
-    print(args.inputfile)
-    print(f'Region UUID      : {uuid_bytes_to_str(region_id)}')
-    print(f'Expected entries : {expected}')
-    print(f'Read entries     : {len(entries)}')
+    print(f'=== {args.inputfile} ===')
+    print(f'Region UUID  : {uuid_bytes_to_str(region_id)}')
+    print(f'Expected     : {expected} entries')
+    print(f'Read         : {len(entries)} entries')
     print()
-
     for i, e in enumerate(entries[:30]):
         h = e.header
-        print(
-            f'{i:4d} local_id={h.local_id:10d} crc=0x{h.crc:08x} '
-            f'body={h.body_size:5d}B hits={h.hit_count} dupes={h.dupe_count}'
-        )
+        print(f'  [{i:4d}] local_id={h.local_id:10d}  '
+              f'crc={h.crc:08x}  '
+              f'body={h.body_size:5d}B  '
+              f'hits={h.hit_count}  '
+              f'dupes={h.dupe_count}')
     if len(entries) > 30:
-        print(f'... {len(entries) - 30} more entries not shown ...')
+        print(f'  ... {len(entries) - 30} more entries not shown ...')
 
 
 def cmd_dump(args):
+    """Dump one entry body by local_id with field decoding."""
     _, _, entries = read_slc(args.inputfile)
     target = int(args.localid)
-
     for e in entries:
         if e.header.local_id == target:
             b = e.body
             obj = decode_object_body(b)
-
-            print(f'local_id {target} body ({len(b)} bytes)')
+            print(f'local_id={target}  body={len(b)} bytes')
             print(hexdump(b, 256))
             print()
-            print(f"  FullID     : {obj.get('full_id', '')}")
+            print(f"  UUID       : {obj.get('full_id', '')}")
             print(f"  LocalID    : {obj.get('local_id', '')}")
             print(f"  PCode      : {obj.get('pcode', '')}")
             print(f"  State      : {obj.get('state', '')}")
-            print(f"  CRC        : {obj.get('crc', '')}")
-            print(f"  Position   : {obj.get('pos_x', '')}, {obj.get('pos_y', '')}, {obj.get('pos_z', '')}")
-            print(f"  Scale      : {obj.get('scale_x', '')}, {obj.get('scale_y', '')}, {obj.get('scale_z', '')}")
-            print(f"  Rotation   : {obj.get('rot_x', '')}, {obj.get('rot_y', '')}, {obj.get('rot_z', '')}")
-            print(f"  UpdateFlags: {obj.get('update_flags', '')}")
+            print(f"  CRC        : 0x{obj.get('crc', 0):08x}" if obj.get('crc', '') != '' else '  CRC        : ')
+            if obj.get('scale') is not None:
+                sx, sy, sz = obj['scale']
+                print(f'  Scale      : ({sx:.4f}, {sy:.4f}, {sz:.4f})')
+            if obj.get('pos') is not None:
+                px, py, pz = obj['pos']
+                print(f'  Position   : ({px:.4f}, {py:.4f}, {pz:.4f})')
+            if obj.get('rot') is not None:
+                rx, ry, rz, rw = obj['rot']
+                print(f'  Rotation   : ({rx:.4f}, {ry:.4f}, {rz:.4f}, {rw:.4f})')
             print(f"  Owner      : {obj.get('owner_id', '')}")
             print(f"  ParentID   : {obj.get('parent_id', '')}")
+            print(f"  SpecialCode: 0x{obj.get('special_code', 0):08x}" if obj.get('special_code') is not None else '  SpecialCode: ')
             return
-
     print(f'local_id {target} not found.')
 
 
@@ -348,7 +399,7 @@ def cmd_list(args):
     print(f'Wrote {len(rows)} rows to {output_path}')
 
 
-# -- Entry point --------------------------------------------------------------
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
