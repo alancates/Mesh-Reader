@@ -2,33 +2,36 @@
 """
 Mesh-Reader: Firestorm/Second Life object cache reader.
 Reads object.cache (index) and objectsXXYY.slc (data) files.
-Based on llvocache.h / llvocache.cpp and Firestorm llviewerobject.cpp.
+Based on llvocache.h / llvocache.cpp from the Firestorm source.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from struct import unpack_from, calcsize
 import argparse
 import binascii
 import csv
 import math
+import uuid
 
 # ── Constants from llvocache.cpp ──────────────────────────────────────────────
-ENTRY_HEADER_SIZE   = 6 * 4      # 6 x S32/U32 = 24 bytes
+ENTRY_HEADER_SIZE = 6 * 4  # 6 x S32/U32 = 24 bytes
 MAX_ENTRY_BODY_SIZE = 10_000
-MAX_NUM_ENTRIES     = 128
-UUID_BYTES          = 16
+MAX_NUM_ENTRIES = 128
+UUID_BYTES = 16
 
 DISCOVERY_COLUMNS = [
-    'source_file', 'record_index', 'local_id', 'full_id', 'parent_id', 'root_id',
-    'pcode', 'state', 'update_flags', 'crc', 'name', 'description', 'owner_id',
-    'creator_id', 'group_id', 'asset_id', 'mesh_id', 'is_root', 'is_child',
-    'is_mesh_candidate', 'pos_x', 'pos_y', 'pos_z', 'scale_x', 'scale_y',
-    'scale_z', 'rot_x', 'rot_y', 'rot_z', 'rot_w', 'distance_from_reference',
-    'bbox_min_x', 'bbox_min_y', 'bbox_min_z', 'bbox_max_x', 'bbox_max_y',
-    'bbox_max_z', 'notes'
+    'source_file', 'record_index', 'local_id', 'full_id', 'parent_id',
+    'root_id', 'pcode', 'state', 'update_flags', 'crc', 'name',
+    'description', 'owner_id', 'creator_id', 'group_id', 'asset_id',
+    'mesh_id', 'is_root', 'is_child', 'is_mesh_candidate', 'pos_x',
+    'pos_y', 'pos_z', 'scale_x', 'scale_y', 'scale_z', 'rot_x', 'rot_y',
+    'rot_z', 'rot_w', 'distance_from_reference', 'bbox_min_x',
+    'bbox_min_y', 'bbox_min_z', 'bbox_max_x', 'bbox_max_y', 'bbox_max_z',
+    'notes'
 ]
+
 
 # ── Structs ───────────────────────────────────────────────────────────────────
 
@@ -53,17 +56,26 @@ class HeaderEntryInfo:
     handle: int = 0
     time: int = 0
 
-    SIZE = calcsize('<iQI')
+    SIZE = calcsize('<IQL')
 
     @classmethod
     def read(cls, data: bytes, offset: int = 0) -> 'HeaderEntryInfo':
-        index, handle, time = unpack_from('<iQI', data, offset)
+        index, handle, time = unpack_from('<IQL', data, offset)
         return cls(index, handle, time)
 
 
 @dataclass
 class VOCacheEntryHeader:
-    """24-byte header preceding each object body in the .slc file"""
+    """
+    24-byte entry header in objectsXXYY.slc
+
+    S32     mLocalID;          //  0
+    U32     mCRC;              //  4
+    U32     mHitCount;         //  8
+    U32     mDupeCount;        // 12
+    U32     mCRCChangeCount;   // 16
+    S32     mBodySize;         // 20
+    """
     local_id: int = 0
     crc: int = 0
     hit_count: int = 0
@@ -71,18 +83,19 @@ class VOCacheEntryHeader:
     crc_change_count: int = 0
     body_size: int = 0
 
+    SIZE = calcsize('<6I')
+
     @classmethod
     def read(cls, data: bytes, offset: int = 0) -> 'VOCacheEntryHeader':
         local_id, crc, hit_count, dupe_count, crc_change_count, body_size = \
-            unpack_from('<IIiiiI', data, offset)
-        return cls(local_id, crc, hit_count, dupe_count,
-                   crc_change_count, body_size)
+            unpack_from('<6I', data, offset)
+        return cls(local_id, crc, hit_count, dupe_count, crc_change_count, body_size)
 
 
 @dataclass
 class VOCacheEntry:
     header: VOCacheEntryHeader
-    body: bytes
+    body: bytes = field(repr=False)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -94,7 +107,7 @@ def hexdump(data: bytes, limit: int = 256) -> str:
         row = chunk[off:off + 16]
         hex_part = ' '.join(f'{b:02x}' for b in row)
         asc_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row)
-        lines.append(f'  {off:04x}  {hex_part:<47}  {asc_part}')
+        lines.append(f' {off:04x}  {hex_part:<47}  {asc_part}')
     return '\n'.join(lines)
 
 
@@ -103,36 +116,28 @@ def uuid_bytes_to_str(b: bytes) -> str:
     return f'{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}'
 
 
-def maybe_uuid(body: bytes, offset: int) -> str:
-    if offset + UUID_BYTES > len(body):
-        return ''
-    raw = body[offset:offset + UUID_BYTES]
-    if not any(raw):
-        return ''
-    return uuid_bytes_to_str(raw)
+def default_csv_path(input_path: str | Path) -> Path:
+    p = Path(input_path)
+    return p.with_suffix('.csv')
 
 
-def default_csv_path(input_path):
-    input_path = Path(input_path)
-    return input_path.with_suffix('.csv')
+def decode_entry_fields(entry: VOCacheEntry) -> dict:
+    """
+    Minimal shared decode path for .slc object bodies.
+    Reused by dump/list so field extraction stays in one place.
+    """
+    h = entry.header
+    b = entry.body
 
-
-def unpack_vec3(body: bytes, offset: int):
-    if offset + 12 > len(body):
-        return None
-    return unpack_from('<fff', body, offset)
-
-
-def decode_object_body(body: bytes) -> dict:
-    obj = {
+    decoded = {
+        'local_id': h.local_id,
+        'crc': h.crc,
         'full_id': '',
-        'local_id': '',
         'parent_id': '',
         'root_id': '',
         'pcode': '',
         'state': '',
         'update_flags': '',
-        'crc': '',
         'name': '',
         'description': '',
         'owner_id': '',
@@ -143,88 +148,100 @@ def decode_object_body(body: bytes) -> dict:
         'pos': None,
         'scale': None,
         'rot': None,
-        'special_code': None,
-        'notes': ''
+        'notes': [],
     }
 
-    if len(body) < 0x44:
-        obj['notes'] = 'body_too_small'
-        return obj
+    if len(b) < 0x44:
+        decoded['notes'].append('body_too_short')
+        return decoded
 
-    obj['full_id'] = maybe_uuid(body, 0x00)
-    obj['local_id'] = unpack_from('<I', body, 0x10)[0]
-    obj['pcode'] = body[0x14]
-    obj['state'] = body[0x15]
-    obj['crc'] = unpack_from('<I', body, 0x16)[0]
-    obj['scale'] = unpack_vec3(body, 0x1C)
-    obj['pos'] = unpack_vec3(body, 0x28)
+    try:
+        decoded['full_id'] = uuid_bytes_to_str(b[0:16])
 
-    rot_xyz = unpack_vec3(body, 0x34)
-    if rot_xyz is not None:
-        rx, ry, rz = rot_xyz
-        rw_sq = max(0.0, 1.0 - (rx * rx + ry * ry + rz * rz))
-        obj['rot'] = (rx, ry, rz, math.sqrt(rw_sq))
+        local_id, = unpack_from('<I', b, 0x10)
+        decoded['local_id'] = local_id
+        decoded['pcode'] = b[0x14]
+        decoded['state'] = b[0x15]
 
-    obj['special_code'] = unpack_from('<I', body, 0x40)[0]
-    obj['owner_id'] = maybe_uuid(body, 0x44)
+        crc, = unpack_from('<I', b, 0x16)
+        decoded['crc'] = crc
 
-    offset = 0x54
-    if obj['special_code'] & 0x80:
-        if offset + 12 > len(body):
-            obj['notes'] = 'truncated_omega'
-            return obj
-        offset += 12
+        decoded['scale'] = unpack_from('<fff', b, 0x1C)
+        decoded['pos'] = unpack_from('<fff', b, 0x28)
+        rot_xyz = unpack_from('<fff', b, 0x34)
+        decoded['rot'] = (rot_xyz[0], rot_xyz[1], rot_xyz[2], '')
 
-    if obj['special_code'] & 0x20:
-        if offset + 4 > len(body):
-            obj['notes'] = 'truncated_parent_id'
-            return obj
-        obj['parent_id'] = unpack_from('<I', body, offset)[0]
+        update_flags, = unpack_from('<I', b, 0x40)
+        decoded['update_flags'] = update_flags
 
-    notes = []
-    if obj['special_code'] & 0x20:
-        notes.append('has_parent')
-    if obj['pcode'] == 9:
-        notes.append('mesh_pcode')
-    obj['notes'] = ','.join(notes)
-    return obj
+        if len(b) >= 0x48:
+            parent_id, = unpack_from('<I', b, 0x44)
+            decoded['parent_id'] = parent_id
+            decoded['root_id'] = local_id if parent_id == 0 else ''
+
+        if decoded['pcode'] == 9:
+            decoded['mesh_id'] = decoded['full_id']
+
+    except Exception as exc:
+        decoded['notes'].append(f'decode_error={exc}')
+
+    return decoded
 
 
 def object_to_discovery_row(obj, source_file, record_index, ref_point=None):
-    row = {col: '' for col in DISCOVERY_COLUMNS}
+    row = {k: '' for k in DISCOVERY_COLUMNS}
     row['source_file'] = source_file
     row['record_index'] = record_index
-    row['local_id'] = obj.get('local_id', '')
-    row['full_id'] = obj.get('full_id', '')
-    row['parent_id'] = obj.get('parent_id', '')
-    row['root_id'] = obj.get('root_id', '')
-    row['pcode'] = obj.get('pcode', '')
-    row['state'] = obj.get('state', '')
-    row['update_flags'] = obj.get('update_flags', '')
-    row['crc'] = obj.get('crc', '')
-    row['name'] = obj.get('name', '')
-    row['description'] = obj.get('description', '')
-    row['owner_id'] = obj.get('owner_id', '')
-    row['creator_id'] = obj.get('creator_id', '')
-    row['group_id'] = obj.get('group_id', '')
-    row['asset_id'] = obj.get('asset_id', '')
-    row['mesh_id'] = obj.get('mesh_id', '')
 
-    parent_id = obj.get('parent_id', '')
-    row['is_root'] = parent_id in ('', None, 0)
-    row['is_child'] = not row['is_root']
-    row['is_mesh_candidate'] = bool(obj.get('pcode') == 9 or obj.get('mesh_id'))
+    decoded = decode_entry_fields(obj)
 
-    pos = obj.get('pos')
-    scale = obj.get('scale')
-    rot = obj.get('rot')
+    row['local_id'] = decoded['local_id']
+    row['full_id'] = decoded['full_id']
+    row['parent_id'] = decoded['parent_id']
+    row['root_id'] = decoded['root_id']
+    row['pcode'] = decoded['pcode']
+    row['state'] = decoded['state']
+    row['update_flags'] = decoded['update_flags']
+    row['crc'] = decoded['crc']
+    row['name'] = decoded['name']
+    row['description'] = decoded['description']
+    row['owner_id'] = decoded['owner_id']
+    row['creator_id'] = decoded['creator_id']
+    row['group_id'] = decoded['group_id']
+    row['asset_id'] = decoded['asset_id']
+    row['mesh_id'] = decoded['mesh_id']
+
+    parent_id = decoded['parent_id']
+    if parent_id != '':
+        row['is_root'] = 1 if parent_id == 0 else 0
+        row['is_child'] = 1 if parent_id != 0 else 0
+
+    pcode = decoded['pcode']
+    if pcode != '':
+        row['is_mesh_candidate'] = 1 if pcode == 9 else 0
+
+    pos = decoded['pos']
+    scale = decoded['scale']
+    rot = decoded['rot']
 
     if pos is not None:
         row['pos_x'], row['pos_y'], row['pos_z'] = pos
+
     if scale is not None:
         row['scale_x'], row['scale_y'], row['scale_z'] = scale
+
     if rot is not None:
         row['rot_x'], row['rot_y'], row['rot_z'], row['rot_w'] = rot
+
+    if pos is not None and scale is not None:
+        px, py, pz = pos
+        sx, sy, sz = scale
+        row['bbox_min_x'] = px - (sx / 2.0)
+        row['bbox_min_y'] = py - (sy / 2.0)
+        row['bbox_min_z'] = pz - (sz / 2.0)
+        row['bbox_max_x'] = px + (sx / 2.0)
+        row['bbox_max_y'] = py + (sy / 2.0)
+        row['bbox_max_z'] = pz + (sz / 2.0)
 
     if ref_point is not None and pos is not None:
         dx = pos[0] - ref_point[0]
@@ -232,18 +249,7 @@ def object_to_discovery_row(obj, source_file, record_index, ref_point=None):
         dz = pos[2] - ref_point[2]
         row['distance_from_reference'] = math.sqrt(dx * dx + dy * dy + dz * dz)
 
-    if pos is not None and scale is not None:
-        hx = scale[0] / 2.0
-        hy = scale[1] / 2.0
-        hz = scale[2] / 2.0
-        row['bbox_min_x'] = pos[0] - hx
-        row['bbox_min_y'] = pos[1] - hy
-        row['bbox_min_z'] = pos[2] - hz
-        row['bbox_max_x'] = pos[0] + hx
-        row['bbox_max_y'] = pos[1] + hy
-        row['bbox_max_z'] = pos[2] + hz
-
-    row['notes'] = obj.get('notes', '')
+    row['notes'] = '; '.join(decoded['notes'])
     return row
 
 
@@ -276,18 +282,19 @@ def read_slc(path: str | Path) -> tuple[bytes, int, list[VOCacheEntry]]:
     region_id = data[offset:offset + UUID_BYTES]
     offset += UUID_BYTES
 
-    num_entries, = unpack_from('<i', data, offset)
+    num_entries, = unpack_from('<I', data, offset)
     offset += 4
 
     entries = []
     for _ in range(num_entries):
         if offset + ENTRY_HEADER_SIZE > len(data):
             break
+
         hdr = VOCacheEntryHeader.read(data, offset)
         offset += ENTRY_HEADER_SIZE
 
         if hdr.body_size <= 0 or hdr.body_size > MAX_ENTRY_BODY_SIZE:
-            print(f'  WARNING: bogus body_size {hdr.body_size} '
+            print(f'WARNING: bogus body_size {hdr.body_size} '
                   f'for local_id {hdr.local_id}, stopping.')
             break
 
@@ -311,9 +318,9 @@ def cmd_index(args):
     for i, e in enumerate(entries):
         rx = (e.handle >> 32) & 0xFFFFFFFF
         ry = e.handle & 0xFFFFFFFF
-        print(f'  [{i:3d}] index={e.index:4d}  '
-              f'region=({rx},{ry})  '
-              f'handle=0x{e.handle:016x}  '
+        print(f'[{i:3d}] index={e.index:4d} '
+              f'region=({rx},{ry}) '
+              f'handle=0x{e.handle:016x} '
               f'time={e.time}')
 
 
@@ -321,89 +328,87 @@ def cmd_inspect(args):
     """Inspect an .slc data file."""
     region_id, expected, entries = read_slc(args.inputfile)
     print(f'=== {args.inputfile} ===')
-    print(f'Region UUID  : {uuid_bytes_to_str(region_id)}')
-    print(f'Expected     : {expected} entries')
-    print(f'Read         : {len(entries)} entries')
+    print(f'Region UUID : {uuid_bytes_to_str(region_id)}')
+    print(f'Expected    : {expected} entries')
+    print(f'Read        : {len(entries)} entries')
     print()
     for i, e in enumerate(entries[:30]):
         h = e.header
-        print(f'  [{i:4d}] local_id={h.local_id:10d}  '
-              f'crc={h.crc:08x}  '
-              f'body={h.body_size:5d}B  '
-              f'hits={h.hit_count}  '
+        print(f'[{i:4d}] local_id={h.local_id:10d} '
+              f'crc={h.crc:08x} '
+              f'body={h.body_size:5d}B '
+              f'hits={h.hit_count} '
               f'dupes={h.dupe_count}')
     if len(entries) > 30:
-        print(f'  ... {len(entries) - 30} more entries not shown ...')
+        print(f'... {len(entries) - 30} more entries not shown ...')
 
 
 def cmd_dump(args):
     """Dump one entry body by local_id with field decoding."""
     _, _, entries = read_slc(args.inputfile)
     target = int(args.localid)
+
     for e in entries:
         if e.header.local_id == target:
             b = e.body
-            obj = decode_object_body(b)
-            print(f'local_id={target}  body={len(b)} bytes')
+            decoded = decode_entry_fields(e)
+
+            print(f'local_id={target} body={len(b)} bytes')
             print(hexdump(b, 256))
             print()
-            print(f"  UUID       : {obj.get('full_id', '')}")
-            print(f"  LocalID    : {obj.get('local_id', '')}")
-            print(f"  PCode      : {obj.get('pcode', '')}")
-            print(f"  State      : {obj.get('state', '')}")
-            print(f"  CRC        : 0x{obj.get('crc', 0):08x}" if obj.get('crc', '') != '' else '  CRC        : ')
-            if obj.get('scale') is not None:
-                sx, sy, sz = obj['scale']
-                print(f'  Scale      : ({sx:.4f}, {sy:.4f}, {sz:.4f})')
-            if obj.get('pos') is not None:
-                px, py, pz = obj['pos']
-                print(f'  Position   : ({px:.4f}, {py:.4f}, {pz:.4f})')
-            if obj.get('rot') is not None:
-                rx, ry, rz, rw = obj['rot']
-                print(f'  Rotation   : ({rx:.4f}, {ry:.4f}, {rz:.4f}, {rw:.4f})')
-            print(f"  Owner      : {obj.get('owner_id', '')}")
-            print(f"  ParentID   : {obj.get('parent_id', '')}")
-            print(f"  SpecialCode: 0x{obj.get('special_code', 0):08x}" if obj.get('special_code') is not None else '  SpecialCode: ')
+
+            if decoded['full_id']:
+                print(f'Object UUID: {decoded["full_id"]}')
+            if decoded['parent_id'] != '':
+                print(f'Parent ID : {decoded["parent_id"]}')
+            if decoded['pcode'] != '':
+                print(f'PCode     : {decoded["pcode"]}')
+            if decoded['state'] != '':
+                print(f'State     : {decoded["state"]}')
+            if decoded['update_flags'] != '':
+                print(f'Flags     : {decoded["update_flags"]}')
+            if decoded['scale'] is not None:
+                sx, sy, sz = decoded['scale']
+                print(f'Scale     : ({sx}, {sy}, {sz})')
+            if decoded['pos'] is not None:
+                px, py, pz = decoded['pos']
+                print(f'Position  : ({px}, {py}, {pz})')
+            if decoded['rot'] is not None:
+                rx, ry, rz, rw = decoded['rot']
+                print(f'Rotation  : ({rx}, {ry}, {rz}, {rw})')
+            if decoded['notes']:
+                print(f'Notes     : {"; ".join(decoded["notes"])}')
             return
+
     print(f'local_id {target} not found.')
 
 
 def cmd_list(args):
+    """Export all decoded objects from one .slc file to CSV discovery report."""
     _, _, entries = read_slc(args.inputfile)
-    input_path = Path(args.inputfile)
-    output_path = Path(args.output) if args.output else default_csv_path(input_path)
+    output_path = Path(args.output) if args.output else default_csv_path(args.inputfile)
 
     ref_point = None
     if args.ref_x is not None and args.ref_y is not None and args.ref_z is not None:
         ref_point = (args.ref_x, args.ref_y, args.ref_z)
 
-    rows = []
-    for i, entry in enumerate(entries):
-        obj = decode_object_body(entry.body)
-        if not obj.get('local_id'):
-            obj['local_id'] = entry.header.local_id
-        if obj.get('crc', '') == '':
-            obj['crc'] = entry.header.crc
-        rows.append(object_to_discovery_row(
-            obj,
-            source_file=input_path.name,
-            record_index=i,
-            ref_point=ref_point,
-        ))
-
     with output_path.open('w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=DISCOVERY_COLUMNS)
         writer.writeheader()
-        writer.writerows(rows)
+        for i, e in enumerate(entries):
+            writer.writerow(
+                object_to_discovery_row(e, Path(args.inputfile).name, i, ref_point)
+            )
 
-    print(f'Wrote {len(rows)} rows to {output_path}')
+    print(f'Wrote {len(entries)} rows to {output_path}')
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Read Firestorm/SL object cache files.')
+        description='Read Firestorm/SL object cache files.'
+    )
     sub = parser.add_subparsers(dest='command', required=True)
 
     p = sub.add_parser('index', help='Read object.cache index')
@@ -416,18 +421,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('inputfile', help='Path to .slc file')
     p.add_argument('localid', help='Local object ID to dump')
 
-    p = sub.add_parser('list', help='Export a CSV discovery report from a .slc file')
+    p = sub.add_parser('list', help='Export .slc entries to CSV discovery report')
     p.add_argument('inputfile', help='Path to .slc file')
     p.add_argument('-o', '--output', help='Path to output CSV')
-    p.add_argument('--ref-x', type=float, default=None, help='Reference X for distance')
-    p.add_argument('--ref-y', type=float, default=None, help='Reference Y for distance')
-    p.add_argument('--ref-z', type=float, default=None, help='Reference Z for distance')
+    p.add_argument('--ref-x', type=float, help='Reference X for distance calculation')
+    p.add_argument('--ref-y', type=float, help='Reference Y for distance calculation')
+    p.add_argument('--ref-z', type=float, help='Reference Z for distance calculation')
 
     return parser
 
 
 def main():
     args = build_parser().parse_args()
+
     if args.command == 'index':
         cmd_index(args)
     elif args.command == 'inspect':
