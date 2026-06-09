@@ -65,7 +65,13 @@ def get_section_data(data, header, data_start, section_name):
     info = header[section_name]
     offset = info["offset"]
     size = info["size"]
+    if size == 0:
+        return None
     compressed = data[data_start + offset: data_start + offset + size]
+    # Newer Firestorm versions pre-allocate section space filled with zeros for
+    # sections not yet downloaded from the CDN.  Detect and skip them.
+    if not compressed or compressed[0] == 0:
+        return None
     # Use decompressobj — Firestorm omits the zlib adler32 footer so zlib.decompress() rejects it
     return zlib.decompressobj().decompress(compressed)
 

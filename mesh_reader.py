@@ -305,10 +305,16 @@ def parse_nv_string(nv_text: str) -> dict[str, str]:
     return result
 
 
+SCULPT_PARAM_TYPE = 0x0030   # LLSculptParams extra-param type id
+SCULPT_TYPE_MESH  = 5        # mSculptType value that means "mesh asset"
+
+
 def extract_nv_from_body(body: bytes) -> dict[str, str]:
     """
-    Walk the variable-length payload of a .slc entry body and extract
-    the NameValue string if SC_NAME_VALUE (0x100) is set.
+    Walk the variable-length payload of a .slc entry body.
+    Returns the NameValue dict (may be empty).
+
+    Also call extract_body_params() if you need the mesh UUID too.
 
     Payload layout after fixed header (llviewerobject.cpp OUT_FULL_COMPRESSED):
       +0x54  Owner UUID (already in fixed header, cursor at 0x54)
@@ -325,82 +331,87 @@ def extract_nv_from_body(body: bytes) -> dict[str, str]:
         if SC_SOUND (0x10): 16 UUID + F32 gain + U8 flags + F32 radius
         if SC_NAME_VALUE (0x100): null-term string  <-- we want this
     """
+    mesh_id = ''
+    nv_dict: dict[str, str] = {}
+
     if len(body) < FIXED_HEADER_END:
-        return {}
+        return nv_dict, mesh_id
 
     try:
         sc, = unpack_from('<I', body, OFF_SPECIAL)
     except Exception:
-        return {}
-
-    if not (sc & SC_NAME_VALUE):
-        return {}
+        return nv_dict, mesh_id
 
     cursor = FIXED_HEADER_END
 
-    # -- skip conditional spatial fields --
+    # -- conditional spatial fields --
     if sc & SC_OMEGA:
         cursor += 12
     if sc & SC_PARENT_ID:
         cursor += 4
 
-    # -- skip scratch-pad / tree data --
+    # -- scratch-pad / tree data --
     if sc & SC_TREE:
-        cursor += 1                          # 1-byte tree genome
+        cursor += 1
     elif sc & SC_SCRATCHPAD:
         if cursor + 4 > len(body):
-            return {}
+            return nv_dict, mesh_id
         size, = unpack_from('<I', body, cursor)
         cursor += 4 + size
 
-    # -- skip floating text + colour --
+    # -- floating text + colour --
     if sc & SC_TEXT:
-        # null-terminated string
         nul = body.find(b'\x00', cursor)
         if nul < 0:
-            return {}
-        cursor = nul + 1 + 4                 # skip string + 4-byte RGBA colour
+            return nv_dict, mesh_id
+        cursor = nul + 1 + 4
 
-    # -- skip media URL --
+    # -- media URL --
     if sc & SC_MEDIA_URL:
         nul = body.find(b'\x00', cursor)
         if nul < 0:
-            return {}
+            return nv_dict, mesh_id
         cursor = nul + 1
 
-    # -- skip legacy particle block (always 86 bytes when present) --
+    # -- legacy particle block (86 bytes) --
     if sc & SC_PARTICLES:
         cursor += 86
 
-    # -- skip extra parameters block --
+    # -- extra parameters block (always present; walk regardless of SC_NAME_VALUE) --
     if cursor >= len(body):
-        return {}
+        return nv_dict, mesh_id
     num_params = body[cursor]
     cursor += 1
     for _ in range(num_params):
         if cursor + 6 > len(body):
-            return {}
-        # U16 param_type + S32 param_size + param_data
-        _ptype, = unpack_from('<H', body, cursor)
+            return nv_dict, mesh_id
+        ptype, = unpack_from('<H', body, cursor)
         cursor += 2
-        psize,  = unpack_from('<i', body, cursor)
-        cursor += 4 + max(0, psize)
+        psize, = unpack_from('<i', body, cursor)
+        cursor += 4
+        data_start = cursor
+        cursor += max(0, psize)
+        # Sculpt/mesh extra param: 16-byte UUID + 1-byte sculpt_type
+        if ptype == SCULPT_PARAM_TYPE and psize == 17:
+            sculpt_type = body[data_start + 16]
+            if sculpt_type == SCULPT_TYPE_MESH:
+                mesh_id = uuid_bytes_to_str(body[data_start:data_start + 16])
 
-    # -- skip sound block --
+    # -- sound block --
     if sc & SC_SOUND:
-        cursor += 16 + 4 + 1 + 4             # UUID + gain(F32) + flags(U8) + radius(F32)
+        cursor += 16 + 4 + 1 + 4
 
-    # -- NameValue string is here --
-    if not (sc & SC_NAME_VALUE):
-        return {}
-    nul = body.find(b'\x00', cursor)
-    if nul < 0:
-        return {}
-    try:
-        nv_text = body[cursor:nul].decode('utf-8', errors='replace')
-    except Exception:
-        return {}
-    return parse_nv_string(nv_text)
+    # -- NameValue string --
+    if sc & SC_NAME_VALUE:
+        nul = body.find(b'\x00', cursor)
+        if nul >= 0:
+            try:
+                nv_text = body[cursor:nul].decode('utf-8', errors='replace')
+                nv_dict = parse_nv_string(nv_text)
+            except Exception:
+                pass
+
+    return nv_dict, mesh_id
 
 
 # ── CSV row builder ───────────────────────────────────────────────────────────
@@ -414,6 +425,7 @@ def entry_to_discovery_row(entry: VOCacheEntry, source_file: str,
     row['update_flags']  = entry.header.crc   # per-entry crc from the slc header
 
     d = decode_entry_body(entry.body)
+    _nv, mesh_id = extract_nv_from_body(entry.body)
 
     row['local_id']    = d['local_id']   if d['local_id'] != '' else entry.header.local_id
     row['full_id']     = d['full_id']
@@ -433,7 +445,9 @@ def entry_to_discovery_row(entry: VOCacheEntry, source_file: str,
         row['is_child']          = 1 if parent_id != 0 else 0
         row['is_mesh_candidate'] = 1 if d['pcode'] == PCODE_VOLUME else 0
         if d['pcode'] == PCODE_VOLUME:
-            row['mesh_id'] = d['full_id']
+            # Use the sculpt/mesh UUID from extra params if available;
+            # fall back to the object's own full_id if not a mesh object
+            row['mesh_id'] = mesh_id if mesh_id else d['full_id']
 
     pos   = d['pos']
     scale = d['scale']
@@ -692,8 +706,8 @@ def cmd_search(args):
             if pcode_filter is not None and pcode != pcode_filter:
                 continue
 
-            # Extract NV pairs (cheap: only done when SC_NAME_VALUE bit is set)
-            nv = extract_nv_from_body(body)
+            # Extract NV pairs and mesh UUID from extra params
+            nv, _mesh_id = extract_nv_from_body(body)
             obj_name = nv.get('NAME', '')
             obj_desc = nv.get('DESC', '')
 
