@@ -20,3 +20,11 @@ Each entry records one important choice: what we decided, why, and what we consi
 
 - Decision: TBD — to be decided in first working session.
 - Options: Python (easiest for file parsing and Blender compatibility), PHP (familiar but not ideal for binary parsing), C# or C++.
+
+2026-06-08 – Vertex weights requirement
+---------------------------------------
+
+* Decision: Preserve and export vertex weight data when available in mesh assets.
+* Why: Vertex weights are required for proper rigging / deformation and are necessary for character or weighted mesh recovery.
+* Consequence: OBJ can remain an early geometry-export format, but a weight-capable format or sidecar export will be needed for full fidelity.
+* Alternatives considered: Ignore weights for first version; export geometry only.
