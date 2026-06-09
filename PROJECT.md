@@ -1,8 +1,8 @@
 # Project plan
 
-## Goal
+## Goal: 
 
-Read and save Second Life mesh cached files as OBJ or other Blender-importable formats.
+Read and export Second Life mesh cached files into a Blender-importable format that preserves geometry, UVs, and vertex weights.
 
 ## MVP
 
