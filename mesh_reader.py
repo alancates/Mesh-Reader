@@ -275,6 +275,134 @@ def decode_entry_body(body: bytes) -> dict:
 
     return d
 
+# ── NameValue parser ─────────────────────────────────────────────────────────
+
+def parse_nv_string(nv_text: str) -> dict[str, str]:
+    """
+    Parse a NameValue list string into a dict of {name: value}.
+
+    Format (from llnamevalue.cpp LLNameValue::LLNameValue(const char *data)):
+      Each line: "NAME Type Class SendTo value"
+      e.g.  "NAME String RW SIM Joe's Hat"
+            "DESC String RW SIM A red hat"
+      Lines are separated by '\\n'; the whole block is null-terminated.
+
+    We only extract the name and value fields; type/class/sendto are skipped.
+    """
+    result: dict[str, str] = {}
+    for line in nv_text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        # Fields are whitespace-delimited; value is everything after the 4th token
+        parts = line.split(None, 4)   # split into at most 5 parts
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        # value is the 5th token if all 4 header fields are present, else 2nd
+        value = parts[4] if len(parts) == 5 else parts[-1]
+        result[key] = value
+    return result
+
+
+def extract_nv_from_body(body: bytes) -> dict[str, str]:
+    """
+    Walk the variable-length payload of a .slc entry body and extract
+    the NameValue string if SC_NAME_VALUE (0x100) is set.
+
+    Payload layout after fixed header (llviewerobject.cpp OUT_FULL_COMPRESSED):
+      +0x54  Owner UUID (already in fixed header, cursor at 0x54)
+      conditional:
+        if SC_OMEGA   (0x80)  : 12 bytes  Omega vec3
+        if SC_PARENT_ID (0x20): 4  bytes  ParentID
+      then:
+        if SC_TREE  (0x02): 1 byte  TreeData
+        elif SC_SCRATCHPAD (0x01): 4-byte size + data
+        if SC_TEXT  (0x04): null-term string + 4 bytes colour
+        if SC_MEDIA_URL (0x200): null-term string
+        if SC_PARTICLES (0x08): fixed 86-byte legacy particle block
+        if SC_NUM_PARAMS: 1-byte count then for each: U16 type + S32-prefixed data
+        if SC_SOUND (0x10): 16 UUID + F32 gain + U8 flags + F32 radius
+        if SC_NAME_VALUE (0x100): null-term string  <-- we want this
+    """
+    if len(body) < FIXED_HEADER_END:
+        return {}
+
+    try:
+        sc, = unpack_from('<I', body, OFF_SPECIAL)
+    except Exception:
+        return {}
+
+    if not (sc & SC_NAME_VALUE):
+        return {}
+
+    cursor = FIXED_HEADER_END
+
+    # -- skip conditional spatial fields --
+    if sc & SC_OMEGA:
+        cursor += 12
+    if sc & SC_PARENT_ID:
+        cursor += 4
+
+    # -- skip scratch-pad / tree data --
+    if sc & SC_TREE:
+        cursor += 1                          # 1-byte tree genome
+    elif sc & SC_SCRATCHPAD:
+        if cursor + 4 > len(body):
+            return {}
+        size, = unpack_from('<I', body, cursor)
+        cursor += 4 + size
+
+    # -- skip floating text + colour --
+    if sc & SC_TEXT:
+        # null-terminated string
+        nul = body.find(b'\x00', cursor)
+        if nul < 0:
+            return {}
+        cursor = nul + 1 + 4                 # skip string + 4-byte RGBA colour
+
+    # -- skip media URL --
+    if sc & SC_MEDIA_URL:
+        nul = body.find(b'\x00', cursor)
+        if nul < 0:
+            return {}
+        cursor = nul + 1
+
+    # -- skip legacy particle block (always 86 bytes when present) --
+    if sc & SC_PARTICLES:
+        cursor += 86
+
+    # -- skip extra parameters block --
+    if cursor >= len(body):
+        return {}
+    num_params = body[cursor]
+    cursor += 1
+    for _ in range(num_params):
+        if cursor + 6 > len(body):
+            return {}
+        # U16 param_type + S32 param_size + param_data
+        _ptype, = unpack_from('<H', body, cursor)
+        cursor += 2
+        psize,  = unpack_from('<i', body, cursor)
+        cursor += 4 + max(0, psize)
+
+    # -- skip sound block --
+    if sc & SC_SOUND:
+        cursor += 16 + 4 + 1 + 4             # UUID + gain(F32) + flags(U8) + radius(F32)
+
+    # -- NameValue string is here --
+    if not (sc & SC_NAME_VALUE):
+        return {}
+    nul = body.find(b'\x00', cursor)
+    if nul < 0:
+        return {}
+    try:
+        nv_text = body[cursor:nul].decode('utf-8', errors='replace')
+    except Exception:
+        return {}
+    return parse_nv_string(nv_text)
+
+
 # ── CSV row builder ───────────────────────────────────────────────────────────
 
 def entry_to_discovery_row(entry: VOCacheEntry, source_file: str,
@@ -510,6 +638,120 @@ def cmd_list(args):
             )
     print(f'Wrote {len(entries)} rows to {output_path}')
 
+def cmd_search(args):
+    """
+    Search one or more .slc files for objects by name or description.
+
+    Only entries where SC_NAME_VALUE (0x100) is set are decoded for text;
+    all others are skipped cheaply. No full conversion is performed.
+
+    Outputs matching rows to stdout (or --output CSV) with columns:
+      source_file, local_id, full_id, parent_id, pcode, pcode_name,
+      name, description, pos_x, pos_y, pos_z, scale_x, scale_y, scale_z
+    """
+    import glob as _glob
+
+    # Expand any glob patterns in the file list
+    slc_files: list[Path] = []
+    for pattern in args.files:
+        expanded = _glob.glob(pattern)
+        if expanded:
+            slc_files.extend(Path(p) for p in sorted(expanded))
+        else:
+            slc_files.append(Path(pattern))
+
+    query     = args.query.lower() if args.query else None
+    query_nv  = args.nv_key        # e.g. "NAME" or "DESC"
+    exact     = args.exact
+    pcode_filter = int(args.pcode, 0) if args.pcode else None
+
+    SEARCH_COLS = [
+        'source_file', 'local_id', 'full_id', 'parent_id',
+        'pcode', 'pcode_name',
+        'name', 'description',
+        'pos_x', 'pos_y', 'pos_z',
+        'scale_x', 'scale_y', 'scale_z',
+    ]
+
+    rows = []
+
+    for slc_path in slc_files:
+        try:
+            _, _, entries = read_slc(slc_path)
+        except Exception as exc:
+            print(f'WARNING: could not read {slc_path}: {exc}')
+            continue
+
+        for e in entries:
+            body = e.body
+            if len(body) < FIXED_HEADER_END:
+                continue
+
+            # Quick pcode filter before any heavy work
+            pcode = body[OFF_PCODE]
+            if pcode_filter is not None and pcode != pcode_filter:
+                continue
+
+            # Extract NV pairs (cheap: only done when SC_NAME_VALUE bit is set)
+            nv = extract_nv_from_body(body)
+            obj_name = nv.get('NAME', '')
+            obj_desc = nv.get('DESC', '')
+
+            # Apply query filter
+            if query is not None:
+                haystack = obj_name.lower() if query_nv == 'NAME' else \
+                           obj_desc.lower()  if query_nv == 'DESC' else \
+                           (obj_name + '\x00' + obj_desc).lower()
+                if exact:
+                    if query not in (obj_name.lower(), obj_desc.lower()):
+                        continue
+                else:
+                    if query not in haystack:
+                        continue
+
+            # Only decode positional fields if we have a match (or no filter)
+            d = decode_entry_body(body)
+
+            row = {k: '' for k in SEARCH_COLS}
+            row['source_file'] = slc_path.name
+            row['local_id']    = d['local_id']
+            row['full_id']     = d['full_id']
+            row['parent_id']   = d['parent_id']
+            row['pcode']       = pcode
+            row['pcode_name']  = PCODE_NAMES.get(pcode, f'0x{pcode:02x}')
+            row['name']        = obj_name
+            row['description'] = obj_desc
+            if d['pos']:
+                row['pos_x'], row['pos_y'], row['pos_z'] = d['pos']
+            if d['scale']:
+                row['scale_x'], row['scale_y'], row['scale_z'] = d['scale']
+            rows.append(row)
+
+    if not rows:
+        print('No matching objects found.')
+        return
+
+    if args.output:
+        out_path = Path(args.output)
+        with out_path.open('w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=SEARCH_COLS)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f'Wrote {len(rows)} matching objects to {out_path}')
+    else:
+        # Pretty-print to terminal
+        print(f'{"FILE":<24} {"LOCAL_ID":>10}  {"PCODE":<8}  {"NAME":<32}  {"DESC":<32}  {"POS"}')
+        print('-' * 130)
+        for r in rows:
+            pos = f'({r["pos_x"]:.1f}, {r["pos_y"]:.1f}, {r["pos_z"]:.1f})' \
+                  if r['pos_x'] != '' else ''
+            name = str(r['name'])[:32]
+            desc = str(r['description'])[:32]
+            print(f'{str(r["source_file"]):<24} {r["local_id"]:>10}  '
+                  f'{r["pcode_name"]:<8}  {name:<32}  {desc:<32}  {pos}')
+        print(f'\n{len(rows)} object(s) found.')
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -535,6 +777,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--ref-y', type=float, help='Reference Y for distance calculation')
     p.add_argument('--ref-z', type=float, help='Reference Z for distance calculation')
 
+    p = sub.add_parser('search', help='Search .slc files for objects by name/description')
+    p.add_argument('files', nargs='+', help='One or more .slc files (glob patterns accepted)')
+    p.add_argument('-q', '--query',  default=None,
+                   help='Search string (case-insensitive substring match)')
+    p.add_argument('--nv-key', default=None, choices=['NAME', 'DESC'],
+                   help='Restrict search to NAME or DESC only (default: both)')
+    p.add_argument('--exact',  action='store_true',
+                   help='Exact match instead of substring')
+    p.add_argument('--pcode',  default=None,
+                   help='Filter by pcode (e.g. 9 for volume/mesh, 0x09 hex ok)')
+    p.add_argument('-o', '--output', default=None,
+                   help='Write results to CSV file instead of stdout')
+
+
+
     return parser
 
 def main():
@@ -544,6 +801,7 @@ def main():
         'inspect': cmd_inspect,
         'dump':    cmd_dump,
         'list':    cmd_list,
+        'search':  cmd_search,
     }
     dispatch[args.command](args)
 
