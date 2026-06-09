@@ -8,9 +8,9 @@ Read and export Second Life mesh cached files into a Blender-importable format t
 
 - [ ] Identify the mesh cache file format used by Second Life / Firestorm
 - [ ] Parse and decode the mesh data from cache files
-- [ ] Export as OBJ format
-- [ ] Basic command-line or simple UI to select input file
-- [ ] Confirm output imports correctly into Blender
+- [ ] Export geometry, UVs, and vertex weights into a Blender-importable format
+- [ ] Provide a way to browse/search cache contents and select the correct object by name, local ID, UUID, or other metadata before export
+- [ ] Confirm imported mesh in Blender preserves geometry, UVs, and weights
 
 ## Later ideas
 
