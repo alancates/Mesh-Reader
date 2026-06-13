@@ -15,9 +15,13 @@ Each decompressed section is LLSD binary — an array of face maps:
   TexCoord0Domain:{Min:[u,v], Max:[u,v]}  (optional)
   TexCoord0:      binary, uint16 LE * 2 * num_verts (optional)
   TriangleList:   binary, uint16 LE * num_indices
+  Weights:        binary, variable length (optional, per-vertex skin weights)
+                  Up to 4 influences per vertex. Each influence: U8 joint_index + U16LE weight
+                  (weight 0-65535 maps to 0.0-1.0). If fewer than 4 influences, a 0xFF
+                  terminator byte follows. Exactly 4 influences = no terminator.
 
 Skin section (key "skin") contains an LLSD map with joint names, bind shape,
-inverse bind matrices, and per-vertex weights.
+and inverse bind matrices. Per-vertex weights live in the LOD face data.
 
 Usage:
   python mesh_asset.py decode <asset_file> [--lod high|medium|low|lowest]
@@ -128,6 +132,33 @@ def decode_face(face):
     idx_raw = face["TriangleList"]
     count = len(idx_raw) // 2
     result["indices"] = [struct.unpack_from('<H', idx_raw, i*2)[0] for i in range(count)]
+
+    # Per-vertex skin weights (optional).
+    # Format: up to 4 influences per vertex, each 3 bytes:
+    #   byte 0:   joint index (U8, 0-254)
+    #   bytes 1-2: weight as U16 LE (0-65535 maps to 0.0-1.0)
+    # If a vertex has fewer than 4 influences a 0xFF terminator byte follows.
+    # Vertices with exactly 4 influences have no terminator.
+    if "Weights" in face:
+        w_raw = face["Weights"]
+        num_verts = len(result["positions"])
+        vertex_weights = []
+        pos = 0
+        for _ in range(num_verts):
+            influences = []
+            for _ in range(4):
+                if pos >= len(w_raw):
+                    break
+                b = w_raw[pos]
+                if b == 0xFF:
+                    pos += 1  # consume terminator
+                    break
+                joint_idx = b
+                weight = struct.unpack_from('<H', w_raw, pos + 1)[0] / 65535.0
+                influences.append([joint_idx, round(weight, 6)])
+                pos += 3
+            vertex_weights.append(influences)
+        result["weights"] = vertex_weights
 
     return result
 
@@ -270,9 +301,34 @@ def cmd_decode(args):
         skin_raw = get_section_data(data, header, data_start, "skin")
         if skin_raw:
             skin = decode_skin(skin_raw)
+            # Attach per-vertex weights extracted from face data into the skin dict
+            all_face_weights = [f.get("weights") for f in faces]
+            if any(w is not None for w in all_face_weights):
+                skin["vertex_weights"] = all_face_weights
+                has_w = sum(1 for w in all_face_weights if w is not None)
+                print(f"  Weights found in {has_w}/{len(faces)} face(s)")
+            else:
+                print("  No Weights key in face data — vertex_weights not exported")
             weights_path = f"{stem}_skin.json"
             export_weights(skin, weights_path)
             print(f"Skin written: {weights_path}")
+
+
+def cmd_diagnose(args):
+    """Print the keys present in each face of a LOD section."""
+    data, header, data_start = load_asset(args.file)
+    lod = args.lod + "_lod" if not args.lod.endswith("_lod") else args.lod
+    raw = get_section_data(data, header, data_start, lod)
+    if raw is None:
+        print(f"LOD section '{lod}' not found.")
+        return
+    faces_llsd = llsd_binary.parse(raw)
+    print(f"LOD '{lod}': {len(faces_llsd)} face(s)")
+    for i, face in enumerate(faces_llsd):
+        print(f"\n  Face {i} keys:")
+        for k, v in face.items():
+            size = f"  ({len(v)} bytes)" if isinstance(v, (bytes, bytearray)) else ""
+            print(f"    {k}{size}")
 
 
 def main():
@@ -287,12 +343,18 @@ def main():
     p_dec.add_argument("--lod", default="high", choices=["high", "medium", "low", "lowest"],
                        help="Which LOD to export (default: high)")
 
+    p_diag = sub.add_parser("diagnose", help="Print face keys present in a LOD section")
+    p_diag.add_argument("file")
+    p_diag.add_argument("--lod", default="high", choices=["high", "medium", "low", "lowest"])
+
     args = parser.parse_args()
 
     if args.command == "info":
         cmd_info(args)
     elif args.command == "decode":
         cmd_decode(args)
+    elif args.command == "diagnose":
+        cmd_diagnose(args)
 
 
 if __name__ == "__main__":
